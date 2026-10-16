@@ -1,0 +1,506 @@
+import os, re, json, time, hmac, base64, hashlib, secrets, sqlite3, smtplib, urllib.request
+from email.message import EmailMessage
+from datetime import datetime, timezone
+from typing import Any, Dict
+from fastapi import FastAPI, HTTPException, Header, Body
+from fastapi.responses import FileResponse
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DB = os.environ.get("VMS_DB", os.path.join(HERE, "vms.db"))
+EVD = os.path.join(HERE, "evidence"); os.makedirs(EVD, exist_ok=True)
+now = lambda: datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+H = lambda s: hashlib.sha256(s.encode()).hexdigest()
+def hpw(p, salt=None):
+    salt = salt or secrets.token_hex(8)
+    return salt + "$" + hashlib.pbkdf2_hmac("sha256", p.encode(), salt.encode(), 100000).hex()
+def vpw(p, h): return hmac.compare_digest(hpw(p, h.split("$")[0]), h)
+def db():
+    c = sqlite3.connect(DB); c.row_factory = sqlite3.Row; return c
+
+# ------------------------------------------------------------------ schema (one entry per menu)
+YN = ["Yes", "No"]; PERMS = ["admin", "create", "review", "approve", "execute"]
+def F(n, l, t="t", req=0, o=None): return {"n": n, "l": l, "t": t, "req": req, "o": o}
+R = {}
+def D(key, label, fields, wf=0, single=0, perm="admin", title="name"):
+    R[key] = dict(label=label, fields=fields, wf=wf, single=single, perm=perm, title=title)
+WF = ["document-template", "test-cases", "document-creation", "validation-planning"]
+# Administration
+D("sites", "Sites", [F("name", "Site name", "t", 1), F("code", "Site code", "t", 1), F("address", "Address", "a"), F("timezone", "Time zone")])
+D("security-settings", "Security Settings", [F("min_password_length", "Minimum password length", "n", 1), F("max_failed_logins", "Lock account after failed logins", "n", 1), F("session_timeout_min", "Session timeout (minutes)", "n", 1)], single=1, title="min_password_length")
+D("usertypes", "Usertypes", [F("name", "Usertype name", "t", 1), F("description", "Description", "a"), F("permissions", "Permissions", "m", 1, PERMS)])
+D("user", "User", [F("username", "Username", "t", 1), F("name", "Full name", "t", 1), F("email", "Email"), F("usertype", "Usertype", "r", 1, "usertypes"), F("site", "Site", "r", 0, "sites"), F("password", "Password (leave blank to keep)", "p")])
+D("groups", "Groups", [F("name", "Group name", "t", 1), F("members", "Members", "m", 0, "user")])
+D("license", "License", [F("product", "Product", "t", 1), F("licensed_users", "Licensed users", "n", 1), F("valid_from", "Valid from", "d"), F("valid_until", "Valid until", "d", 1), F("license_key", "License reference")], title="product")
+D("approval-config", "Approval config", [F("target", "Applies to", "s", 1, WF), F("approver_usertype", "Approver usertype", "r", 1, "usertypes")], title="target")
+D("esign-config", "E-Sign Config", [F("target", "Signature for", "s", 1, ["Approved", "Obsolete"]), F("meaning", "Signature meaning", "t", 1)], title="target")
+D("id-generation", "ID Generation", [F("target", "Record type", "s", 1, []), F("prefix", "Prefix", "t", 1), F("digits", "Number digits", "n", 1)], title="prefix")
+D("workflow-config", "Validation Workflow Config", [F("target", "Applies to", "s", 1, WF), F("allow_self_approval", "Author may approve own record", "s", 1, YN), F("esign_required", "E-signature required", "s", 1, YN)], title="target")
+D("email-config", "Email Config", [F("enabled", "Enabled", "s", 1, YN), F("smtp_host", "SMTP host", "t", 1), F("smtp_port", "SMTP port", "n"), F("smtp_user", "SMTP user"), F("smtp_password", "SMTP password", "p"), F("from_addr", "From address")], single=1, title="smtp_host")
+D("default-remarks", "Default Remarks", [F("remark", "Remark", "a", 1), F("applies_to", "Used for")], title="remark")
+D("reason-codes", "Reason Code", [F("code", "Code", "t", 1), F("description", "Description", "t", 1)], title="description")
+# Master data
+D("shared-list", "Shared List", [F("name", "List name", "t", 1), F("items", "Items (one per line)", "a", 1)], perm="create")
+D("custom-fields", "Custom fields", [F("target", "Add to", "s", 1, ["sites", "assets", "projects", "products", "supplier", "customers", "test-cases", "document-template", "document-creation", "validation-planning"]), F("label", "Field label", "t", 1), F("ftype", "Field type", "s", 1, ["Text", "Number", "Date", "List"]), F("list", "Shared list (for List type)", "r", 0, "shared-list"), F("required", "Required", "s", 1, YN)], perm="create", title="label")
+D("workplace", "Workplace Hierarchy", [F("name", "Name", "t", 1), F("level", "Level", "s", 1, ["Site", "Building", "Area", "Room"]), F("parent", "Parent", "r", 0, "workplace"), F("site", "Site", "r", 0, "sites")], perm="create")
+D("assets", "Asset Registration", [F("asset_id", "Asset / system ID", "t", 1), F("name", "Name", "t", 1), F("type", "Type", "s", 1, ["Equipment", "Computerized System", "Instrument", "Utility"]), F("version", "Version"), F("vendor", "Supplier/Vendor", "r", 0, "supplier"), F("site", "Site", "r", 0, "sites"), F("workplace", "Workplace", "r", 0, "workplace"), F("criticality", "GxP criticality", "s", 0, ["High", "Medium", "Low"])], perm="create")
+D("products", "Product", [F("name", "Product name", "t", 1), F("code", "Product code"), F("description", "Description", "a")], perm="create")
+D("supplier", "Supplier/Vendor", [F("name", "Name", "t", 1), F("contact", "Contact person"), F("email", "Email"), F("address", "Address", "a")], perm="create")
+D("customers", "Customer", [F("name", "Name", "t", 1), F("contact", "Contact person"), F("email", "Email"), F("address", "Address", "a")], perm="create")
+D("projects", "Project", [F("name", "Project name", "t", 1), F("product", "Product", "r", 0, "products"), F("customer", "Customer", "r", 0, "customers"), F("site", "Site", "r", 0, "sites"), F("asset", "Asset / system", "r", 0, "assets"), F("owner", "Owner", "r", 0, "user"), F("start", "Start date", "d"), F("end", "End date", "d")], perm="create")
+D("document-type", "Document Type", [F("name", "Type name", "t", 1), F("category", "Category", "s", 1, ["Protocol", "Plan", "Report", "SOP", "Other"]), F("review_required", "Review required", "s", 1, YN)], perm="create")
+D("document-template", "Document Template", [F("name", "Template name", "t", 1), F("doc_type", "Document type", "r", 1, "document-type"), F("body", "Body (use {{title}} and {{project}})", "a", 1)], wf=1, perm="create")
+D("test-cases", "Test Case Registration", [F("title", "Title", "t", 1), F("project", "Project", "r", 0, "projects"), F("asset", "Asset / system", "r", 0, "assets"), F("requirement_refs", "Requirement references"), F("preconditions", "Preconditions", "a"), F("exec_type", "Execution type", "s", 1, ["Manual", "Automated"]), F("steps", "Steps: one per line as Instruction | Expected result. Start with [E] if evidence is required", "a", 1)], wf=1, perm="create", title="title")
+D("automation-config", "Automation Configuration", [F("name", "Name", "t", 1), F("tool", "Tool", "s", 1, ["Playwright", "Selenium", "Custom"]), F("runner_url", "Runner URL (http/https)", "t", 1), F("target_url", "Target system URL"), F("runner_token", "Runner token", "p"), F("timeout", "Timeout (seconds)", "n"), F("enabled", "Enabled", "s", 1, YN)], perm="create")
+# Validation management
+D("document-creation", "Document Creation", [F("title", "Title", "t", 1), F("doc_type", "Document type", "r", 1, "document-type"), F("template", "Approved template", "r", 1, "document-template"), F("project", "Project", "r", 0, "projects"), F("content", "Content", "a", 1)], wf=1, perm="create", title="title")
+D("validation-planning", "Validation Planning", [F("title", "Plan title", "t", 1), F("project", "Project", "r", 1, "projects"), F("asset", "Asset / system", "r", 0, "assets"), F("scope", "Scope", "a", 1), F("activities", "Activities", "a"), F("responsible", "Responsible", "r", 0, "user"), F("prerequisites", "Prerequisites", "a"), F("planned_start", "Planned start", "d"), F("planned_end", "Planned end", "d")], wf=1, perm="create", title="title")
+R["id-generation"]["fields"][0]["o"] = list(R)
+MENU = [("Administration", [("Sites", "sites"), ("Security Settings", "security-settings"), ("Identity Access", [("Usertypes", "usertypes"), ("User", "user"), ("Groups", "groups")]), ("License", "license"), ("Approval config", "approval-config"), ("E-Sign Config", "esign-config"), ("ID Generation", "id-generation"), ("Validation Workflow Config", "workflow-config"), ("Email Config", "email-config"), ("Reports", [("Session log", "rep-sessions"), ("User to usertype", "rep-user-usertype"), ("Usertype to permissions", "rep-usertype-perms"), ("User to usertype to permissions", "rep-full-access"), ("Audit trail", "rep-audit")]), ("Auxiliaries", [("Default Remarks", "default-remarks"), ("Reason Code", "reason-codes")])]),
+ ("Master Data", [("Building Block", [("Shared List", "shared-list"), ("Custom fields", "custom-fields")]), ("Workplace Hierarchy", "workplace"), ("Asset Registration", "assets"), ("Project", "projects"), ("Product", "products"), ("Entities", [("Supplier/Vendor", "supplier"), ("Customer", "customers")]), ("Document Template", "document-template"), ("Test Case Registration", "test-cases"), ("Document Type", "document-type"), ("Automation Configuration", "automation-config")]),
+ ("Validation Management", [("Document Creation", "document-creation"), ("Validation Planning", "validation-planning"), ("Validation Execution", [("Manual Execution", "manual-execution"), ("Automation Execution", "automation-execution")]), ("Validation Review/ Approval", "review-approval"), ("Deviation Log", "deviation-log"), ("Re-Execution", "re-execution"), ("Document Report", "document-report")])]
+def menu_json():
+    f = lambda x: {"label": x[0], "key": x[1]} if isinstance(x[1], str) else {"label": x[0], "children": [f(y) for y in x[1]]}
+    return [{"module": m, "items": [f(i) for i in items]} for m, items in MENU]
+
+# ------------------------------------------------------------------ database
+def init():
+    c = db(); c.executescript("""
+    CREATE TABLE IF NOT EXISTS records(id INTEGER PRIMARY KEY,res TEXT,code TEXT,data TEXT,status TEXT,version INTEGER DEFAULT 1,rev_of INTEGER,note TEXT DEFAULT '',created_by TEXT,created_at TEXT,updated_at TEXT);
+    CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,ts TEXT,user TEXT,action TEXT,res TEXT,rec_id INTEGER,detail TEXT,prev TEXT,hash TEXT);
+    CREATE TABLE IF NOT EXISTS esign(id INTEGER PRIMARY KEY,rec_id INTEGER,res TEXT,user TEXT,meaning TEXT,ts TEXT,rec_hash TEXT);
+    CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY,ts TEXT,user TEXT,event TEXT,detail TEXT);
+    CREATE TABLE IF NOT EXISTS runs(id INTEGER PRIMARY KEY,code TEXT,tc_id INTEGER,project_id INTEGER,mode TEXT,config_id INTEGER,executor TEXT,status TEXT,review TEXT,review_by TEXT,review_note TEXT,started TEXT,completed TEXT,retest_of INTEGER,message TEXT DEFAULT '');
+    CREATE TABLE IF NOT EXISTS steps(id INTEGER PRIMARY KEY,run_id INTEGER,n INTEGER,instruction TEXT,expected TEXT,ev_req INTEGER,result TEXT,actual TEXT,comment TEXT,ev_file TEXT,ev_name TEXT,ev_hash TEXT,done_by TEXT,ts TEXT);
+    CREATE TABLE IF NOT EXISTS deviations(id INTEGER PRIMARY KEY,code TEXT,title TEXT,description TEXT,severity TEXT,project_id INTEGER,run_id INTEGER,step_id INTEGER,status TEXT,assigned_to INTEGER,created_by TEXT,created_at TEXT,updated_at TEXT,note TEXT);""")
+    if not c.execute("SELECT 1 FROM records WHERE res='usertypes'").fetchone():
+        for n, p in [("Administrator", PERMS), ("Author", ["create", "execute"]), ("Reviewer", ["review"]), ("Approver", ["review", "approve"])]:
+            add(c, "usertypes", {"name": n, "description": n + " role", "permissions": p}, "system")
+        add(c, "security-settings", {"min_password_length": 8, "max_failed_logins": 5, "session_timeout_min": 30}, "system")
+    c.commit(); c.close()
+
+def log(c, user, action, res, rid, detail=""):
+    p = c.execute("SELECT hash FROM audit ORDER BY id DESC LIMIT 1").fetchone(); prev = p["hash"] if p else "0" * 64; ts = now()
+    c.execute("INSERT INTO audit(ts,user,action,res,rec_id,detail,prev,hash) VALUES(?,?,?,?,?,?,?,?)", (ts, user, action, res, rid, detail, prev, H(prev + ts + user + action + res + str(rid) + detail)))
+def gen_code(c, key):
+    n = c.execute("SELECT COUNT(*) n FROM records WHERE res=?", (key,)).fetchone()["n"] + 1
+    g = c.execute("SELECT data FROM records WHERE res='id-generation' AND status='Active' AND json_extract(data,'$.target')=? ORDER BY id DESC", (key,)).fetchone()
+    if g:
+        d = json.loads(g["data"]); return d["prefix"] + str(n).zfill(int(d["digits"]))
+    return "".join(w[0] for w in re.split(r"[^A-Za-z]+", R[key]["label"]) if w).upper()[:4] + "-%04d" % n
+def add(c, key, data, user, status=None, version=1, rev_of=None, code=None):
+    cur = c.execute("INSERT INTO records(res,code,data,status,version,rev_of,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (key, code or gen_code(c, key), json.dumps(data), status or ("Draft" if R[key]["wf"] else "Active"), version, rev_of, user, now(), now()))
+    log(c, user, "CREATE", key, cur.lastrowid, ""); return cur.lastrowid
+def get(c, res, i):
+    r = c.execute("SELECT * FROM records WHERE id=? AND res=?", (i, res)).fetchone()
+    if not r: raise HTTPException(404, "Record not found")
+    return r
+def setting(c, field, default):
+    r = c.execute("SELECT data FROM records WHERE res='security-settings' ORDER BY id DESC").fetchone()
+    return (json.loads(r["data"]).get(field) if r else None) or default
+def cfgfor(c, res, target):
+    r = c.execute("SELECT data FROM records WHERE res=? AND status='Active' AND json_extract(data,'$.target')=? ORDER BY id DESC", (res, target)).fetchone()
+    return json.loads(r["data"]) if r else None
+def lab(c, i):
+    r = c.execute("SELECT res,code,data FROM records WHERE id=?", (i,)).fetchone()
+    return "" if not r else "%s – %s" % (r["code"], json.loads(r["data"]).get(R[r["res"]]["title"], ""))
+def fields_for(c, key):
+    fs = list(R[key]["fields"])
+    for r in c.execute("SELECT id,data FROM records WHERE res='custom-fields' AND status='Active' AND json_extract(data,'$.target')=?", (key,)):
+        d = json.loads(r["data"]); o = None; t = {"Text": "t", "Number": "n", "Date": "d", "List": "s"}[d["ftype"]]
+        if t == "s":
+            sl = c.execute("SELECT data FROM records WHERE id=?", (d.get("list"),)).fetchone()
+            o = [x.strip() for x in json.loads(sl["data"]).get("items", "").splitlines() if x.strip()] if sl else []
+        fs.append(F("cf_%d" % r["id"], d["label"], t, 1 if d["required"] == "Yes" else 0, o))
+    return fs
+
+# ------------------------------------------------------------------ auth
+TOK = {}
+def me(c, auth):
+    s = TOK.get((auth or "").replace("Bearer ", ""))
+    if not s or s["exp"] < time.time(): raise HTTPException(401, "Session expired. Please sign in again")
+    r = c.execute("SELECT * FROM records WHERE id=? AND res='user'", (s["uid"],)).fetchone()
+    if not r or r["status"] != "Active": raise HTTPException(401, "Account is inactive")
+    d = json.loads(r["data"]); ut = c.execute("SELECT data,code FROM records WHERE id=?", (d.get("usertype"),)).fetchone()
+    s["exp"] = time.time() + 60 * int(setting(c, "session_timeout_min", 30))
+    return {"id": r["id"], "username": d["username"], "name": d["name"], "usertype": d.get("usertype"), "usertype_name": json.loads(ut["data"])["name"] if ut else "", "perms": sorted(set(json.loads(ut["data"]).get("permissions", [])) if ut else [])}
+def has(u, p): return p in u["perms"] or "admin" in u["perms"]
+def need(u, *ps):
+    if not any(has(u, p) for p in ps): raise HTTPException(403, "You do not have permission for this action")
+def chk(key):
+    if key not in R: raise HTTPException(404, "Unknown menu")
+def sess(c, user, event, detail=""): c.execute("INSERT INTO sessions(ts,user,event,detail) VALUES(?,?,?,?)", (now(), user, event, detail))
+
+app = FastAPI(title="Lab Iconics VMS", description="Validation Management System API")
+init()
+Body_ = Dict[str, Any]
+
+@app.get("/")
+def index(): return FileResponse(os.path.join(HERE, "index.html"))
+@app.get("/api/status")
+def status_():
+    c = db(); return {"setup": not c.execute("SELECT 1 FROM records WHERE res='user'").fetchone()}
+@app.post("/api/setup")
+def setup(b: Body_ = Body(...)):
+    c = db()
+    if c.execute("SELECT 1 FROM records WHERE res='user'").fetchone(): raise HTTPException(409, "Setup is already complete")
+    un, nm, pw = str(b.get("username", "")).strip(), str(b.get("name", "")).strip(), str(b.get("password", ""))
+    if not un or not nm or len(pw) < 8: raise HTTPException(422, "Username, name and a password of at least 8 characters are required")
+    ut = c.execute("SELECT id FROM records WHERE res='usertypes' AND json_extract(data,'$.name')='Administrator'").fetchone()["id"]
+    add(c, "user", {"username": un, "name": nm, "usertype": ut, "_password": hpw(pw), "_fails": 0}, "setup"); sess(c, un, "SETUP", "first administrator created"); c.commit(); return {"ok": True}
+@app.post("/api/login")
+def login(b: Body_ = Body(...)):
+    c = db(); un = str(b.get("username", "")).strip()
+    r = c.execute("SELECT * FROM records WHERE res='user' AND json_extract(data,'$.username')=?", (un,)).fetchone()
+    if not r or r["status"] != "Active": sess(c, un, "LOGIN FAILED", "unknown or inactive user"); c.commit(); raise HTTPException(401, "Invalid username or password")
+    d = json.loads(r["data"])
+    if d.get("_fails", 0) >= int(setting(c, "max_failed_logins", 5)): sess(c, un, "LOGIN BLOCKED", "account locked"); c.commit(); raise HTTPException(423, "Account locked. An administrator must reset the password")
+    if not vpw(str(b.get("password", "")), d["_password"]):
+        d["_fails"] = d.get("_fails", 0) + 1; c.execute("UPDATE records SET data=? WHERE id=?", (json.dumps(d), r["id"])); sess(c, un, "LOGIN FAILED", "wrong password"); c.commit(); raise HTTPException(401, "Invalid username or password")
+    d["_fails"] = 0; c.execute("UPDATE records SET data=? WHERE id=?", (json.dumps(d), r["id"])); sess(c, un, "LOGIN"); log(c, un, "LOGIN", "auth", r["id"]); c.commit()
+    t = secrets.token_hex(20); TOK[t] = {"uid": r["id"], "exp": time.time() + 3600}; return {"token": t}
+@app.post("/api/logout")
+def logout(authorization: str = Header(None)):
+    c = db(); u = me(c, authorization); sess(c, u["username"], "LOGOUT"); c.commit(); TOK.pop((authorization or "").replace("Bearer ", ""), None); return {"ok": True}
+@app.get("/api/meta")
+def meta(authorization: str = Header(None)):
+    c = db(); u = me(c, authorization)
+    return {"me": u, "menu": menu_json(), "res": {k: {"label": v["label"], "wf": v["wf"], "single": v["single"], "perm": v["perm"], "title": v["title"]} for k, v in R.items()}}
+
+# ------------------------------------------------------------------ generic records (every menu)
+def pub(c, r):
+    d = {k: v for k, v in json.loads(r["data"]).items() if not k.startswith("_")}; disp = {}
+    for f in fields_for(c, r["res"]):
+        v = d.get(f["n"])
+        if v in (None, "", []): continue
+        if f["t"] == "r": disp[f["n"]] = lab(c, v)
+        elif f["t"] == "m": disp[f["n"]] = ", ".join(lab(c, x) for x in v) if isinstance(f["o"], str) else ", ".join(v)
+    return {"id": r["id"], "code": r["code"], "status": r["status"], "version": r["version"], "note": r["note"], "created_by": r["created_by"], "updated_at": r["updated_at"], "data": d, "disp": disp, "title": d.get(R[r["res"]]["title"], "")}
+def ref_ok(c, res, i):
+    try: r = c.execute("SELECT status FROM records WHERE id=? AND res=?", (int(i), res)).fetchone()
+    except (TypeError, ValueError): return False
+    return bool(r) and r["status"] == ("Approved" if R[res]["wf"] else "Active")
+def clean(c, key, body, old=None, rid=None):
+    out, errs = {}, []
+    for f in fields_for(c, key):
+        n, t, v = f["n"], f["t"], body.get(f["n"])
+        if t == "p":
+            if v:
+                if key == "user" and len(str(v)) < int(setting(c, "min_password_length", 8)): errs.append("Password must be at least %s characters" % setting(c, "min_password_length", 8))
+                out["_" + n] = hpw(str(v)) if key == "user" else str(v)
+                if key == "user": out["_fails"] = 0
+            elif key == "user" and not old: errs.append("Password is required")
+            continue
+        if v in (None, "", []):
+            if f["req"]: errs.append("%s is required" % f["l"])
+            continue
+        if t == "n":
+            try: v = float(v); v = int(v) if v == int(v) else v
+            except (TypeError, ValueError): errs.append("%s must be a number" % f["l"]); continue
+        elif t == "d" and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(v)): errs.append("%s must be a date" % f["l"]); continue
+        elif t == "s" and v not in f["o"]: errs.append("%s has an invalid value" % f["l"]); continue
+        elif t == "r":
+            if not ref_ok(c, f["o"], v) or (f["o"] == key and rid and int(v) == rid): errs.append("%s: choose a valid %s" % (f["l"], "Approved" if R[f["o"]]["wf"] else "Active")); continue
+            v = int(v)
+        elif t == "m":
+            if not isinstance(v, list) or (isinstance(f["o"], list) and any(x not in f["o"] for x in v)) or (isinstance(f["o"], str) and not all(ref_ok(c, f["o"], x) for x in v)): errs.append("%s has an invalid selection" % f["l"]); continue
+        out[n] = v
+    if errs: raise HTTPException(422, "; ".join(errs))
+    for k, v in (old or {}).items():
+        if k.startswith("_") and k not in out: out[k] = v
+    if not R[key]["wf"] and key != "custom-fields" and not R[key]["single"]:
+        f = "username" if key == "user" else R[key]["title"]
+        for r in c.execute("SELECT id,data FROM records WHERE res=? AND status!='Inactive'", (key,)):
+            if r["id"] != rid and str(json.loads(r["data"]).get(f, "")).lower() == str(out.get(f, "")).lower() and out.get(f) is not None: raise HTTPException(409, "A record with this %s already exists" % f)
+    return out
+def in_use(c, key, rid):
+    for k, S in R.items():
+        for f in S["fields"]:
+            if f["o"] != key or f["t"] not in ("r", "m"): continue
+            q = "SELECT code FROM records WHERE res=? AND status IN ('Active','Draft','In Review','Approved') AND " + ("json_extract(data,'$.%s')=?" % f["n"] if f["t"] == "r" else "EXISTS(SELECT 1 FROM json_each(json_extract(data,'$.%s')) WHERE value=?)" % f["n"]) + " LIMIT 1"
+            r = c.execute(q, (k, rid)).fetchone()
+            if r: return r["code"]
+def check_read(u, key):
+    if R[key]["perm"] == "admin" and not has(u, "admin"): raise HTTPException(403, "Administrator access required")
+
+@app.get("/api/r/{key}")
+def lst(key: str, q: str = "", status: str = "", sort: str = "updated_at", desc: bool = True, page: int = 1, size: int = 10, authorization: str = Header(None)):
+    c = db(); u = me(c, authorization); chk(key); check_read(u, key)
+    col = {"code": "code", "status": "status", "created_by": "created_by", "title": "json_extract(data,'$.%s')" % R[key]["title"]}.get(sort, "updated_at")
+    w, p = "res=?", [key]
+    if q: w += " AND (code LIKE ? OR data LIKE ?)"; p += ["%" + q + "%"] * 2
+    if status: w += " AND status=?"; p.append(status)
+    total = c.execute("SELECT COUNT(*) n FROM records WHERE " + w, p).fetchone()["n"]
+    rows = c.execute("SELECT * FROM records WHERE %s ORDER BY %s %s LIMIT ? OFFSET ?" % (w, col, "DESC" if desc else "ASC"), p + [size, (max(page, 1) - 1) * size]).fetchall()
+    return {"total": total, "items": [pub(c, r) for r in rows]}
+@app.get("/api/r/{key}/fields")
+def flds(key: str, authorization: str = Header(None)):
+    c = db(); me(c, authorization); chk(key); return fields_for(c, key)
+@app.get("/api/r/{key}/options")
+def opts(key: str, authorization: str = Header(None)):
+    c = db(); me(c, authorization); chk(key); st = "Approved" if R[key]["wf"] else "Active"
+    return [{"id": r["id"], "label": lab(c, r["id"]), "title": json.loads(r["data"]).get(R[key]["title"], "")} for r in c.execute("SELECT id FROM records WHERE res=? AND status=? ORDER BY id DESC", (key, st))]
+@app.get("/api/r/{key}/{rid}")
+def one(key: str, rid: int, authorization: str = Header(None)):
+    c = db(); u = me(c, authorization); chk(key); check_read(u, key); return pub(c, get(c, key, rid))
+@app.post("/api/r/{key}")
+def create(key: str, body: Body_ = Body(...), authorization: str = Header(None)):
+    c = db(); u = me(c, authorization); chk(key); need(u, R[key]["perm"])
+    if R[key]["single"] and c.execute("SELECT 1 FROM records WHERE res=?", (key,)).fetchone(): raise HTTPException(409, "Already configured. Edit the existing record")
+    data = clean(c, key, body)
+    if key == "user":
+        lic = c.execute("SELECT data FROM records WHERE res='license' AND status='Active' ORDER BY id DESC").fetchone()
+        if lic:
+            d = json.loads(lic["data"])
+            if d["valid_until"] < now()[:10]: raise HTTPException(409, "The license has expired")
+            if c.execute("SELECT COUNT(*) n FROM records WHERE res='user' AND status='Active'").fetchone()["n"] >= int(d["licensed_users"]): raise HTTPException(409, "License limit reached (%s users)" % d["licensed_users"])
+    rid = add(c, key, data, u["username"]); c.commit(); return {"id": rid}
+@app.put("/api/r/{key}/{rid}")
+def update(key: str, rid: int, body: Body_ = Body(...), authorization: str = Header(None)):
+    c = db(); u = me(c, authorization); chk(key); need(u, R[key]["perm"]); r = get(c, key, rid)
+    if r["status"] not in ("Draft", "Active"): raise HTTPException(409, "Only Draft or Active records can be edited. Use Revise for approved records")
+    data = clean(c, key, body, json.loads(r["data"]), rid)
+    c.execute("UPDATE records SET data=?,updated_at=?,version=version+? WHERE id=?", (json.dumps(data), now(), 0 if R[key]["wf"] else 1, rid)); log(c, u["username"], "UPDATE", key, rid, r["code"]); c.commit(); return {"ok": True}
+FLOW = {"Draft": ["In Review"], "In Review": ["Approved", "Draft"], "Approved": ["Obsolete"]}
+TP = {"In Review": ["create"], "Approved": ["approve"], "Draft": ["review", "approve"], "Obsolete": ["approve"]}
+def sign(c, u, key, rid, r, meaning, pw):
+    row = c.execute("SELECT data FROM records WHERE id=?", (u["id"],)).fetchone()
+    if not pw or not vpw(pw, json.loads(row["data"])["_password"]): raise HTTPException(401, "E-signature failed: re-enter your password")
+    c.execute("INSERT INTO esign(rec_id,res,user,meaning,ts,rec_hash) VALUES(?,?,?,?,?,?)", (rid, key, u["username"], meaning, now(), H(json.dumps(dict(r), sort_keys=True))))
+@app.post("/api/r/{key}/{rid}/status")
+def set_status(key: str, rid: int, b: Body_ = Body(...), authorization: str = Header(None)):
+    c = db(); u = me(c, authorization); chk(key); S = R[key]; r = get(c, key, rid); to = b.get("to"); cm = str(b.get("comment") or "").strip()
+    if not S["wf"]:
+        if to not in ("Active", "Inactive") or to == r["status"]: raise HTTPException(409, "Invalid status change")
+        need(u, S["perm"])
+        if to == "Inactive":
+            if not cm: raise HTTPException(422, "A reason is required")
+            used = in_use(c, key, rid)
+            if used: raise HTTPException(409, "Cannot deactivate: still used by " + used)
+        c.execute("UPDATE records SET status=?,note=?,updated_at=? WHERE id=?", (to, cm, now(), rid))
+    else:
+        if to not in FLOW.get(r["status"], []): raise HTTPException(409, "Cannot move from %s to %s. Workflow stages cannot be skipped" % (r["status"], to))
+        need(u, *TP[to]); cfg = cfgfor(c, "workflow-config", key)
+        if to == "Approved":
+            if r["created_by"] == u["username"] and not (cfg and cfg.get("allow_self_approval") == "Yes"): raise HTTPException(403, "The author cannot approve their own record")
+            ac = cfgfor(c, "approval-config", key)
+            if ac and int(ac["approver_usertype"]) != u["usertype"]: raise HTTPException(403, "Only the configured approver usertype can approve this record")
+        if to == "Draft" and not cm: raise HTTPException(422, "A reason is required to return a record")
+        if to in ("Approved", "Obsolete") and not (cfg and cfg.get("esign_required") == "No"):
+            ec = cfgfor(c, "esign-config", to); sign(c, u, key, rid, r, (ec or {}).get("meaning") or to, str(b.get("password") or ""))
+        if to == "Approved":
+            c.execute("UPDATE records SET status='Obsolete' WHERE res=? AND status='Approved' AND id!=? AND (id=? OR rev_of=? OR id=? OR rev_of=?)", (key, rid, r["rev_of"] or rid, r["rev_of"] or rid, r["rev_of"] or -1, r["rev_of"] or -1))
+        c.execute("UPDATE records SET status=?,note=?,updated_at=? WHERE id=?", (to, ("Returned: " + cm) if to == "Draft" else "", now(), rid))
+    log(c, u["username"], "%s -> %s" % (r["status"], to), key, rid, cm); c.commit(); return {"status": to}
+@app.post("/api/r/{key}/{rid}/revise")
+def revise(key: str, rid: int, authorization: str = Header(None)):
+    c = db(); u = me(c, authorization); chk(key); need(u, R[key]["perm"]); r = get(c, key, rid)
+    if not R[key]["wf"] or r["status"] != "Approved": raise HTTPException(409, "Only Approved controlled records can be revised")
+    n = add(c, key, json.loads(r["data"]), u["username"], "Draft", r["version"] + 1, r["rev_of"] or rid, r["code"]); c.commit(); return {"id": n}
+@app.get("/api/r/{key}/{rid}/history")
+def history(key: str, rid: int, authorization: str = Header(None)):
+    c = db(); me(c, authorization); chk(key)
+    return {"audit": [dict(a) for a in c.execute("SELECT ts,user,action,detail,hash FROM audit WHERE res=? AND rec_id=? ORDER BY id", (key, rid))], "signatures": [dict(s) for s in c.execute("SELECT user,meaning,ts,rec_hash FROM esign WHERE res=? AND rec_id=? ORDER BY id", (key, rid))]}
+@app.post("/api/email-test")
+def email_test(b: Body_ = Body(...), authorization: str = Header(None)):
+    c = db(); u = me(c, authorization); need(u, "admin"); r = c.execute("SELECT data FROM records WHERE res='email-config' ORDER BY id DESC").fetchone()
+    if not r: raise HTTPException(422, "Save the Email Config first")
+    d = json.loads(r["data"])
+    if d.get("enabled") != "Yes": raise HTTPException(422, "Email is disabled in Email Config")
+    try:
+        m = EmailMessage(); m["From"] = d.get("from_addr") or d.get("smtp_user"); m["To"] = b.get("to"); m["Subject"] = "VMS test email"; m.set_content("Test email from Lab Iconics VMS.")
+        with smtplib.SMTP(d["smtp_host"], int(d.get("smtp_port") or 587), timeout=15) as s:
+            s.starttls()
+            if d.get("smtp_user"): s.login(d["smtp_user"], d.get("_smtp_password", ""))
+            s.send_message(m)
+    except Exception as e: raise HTTPException(502, "Email failed: " + str(e)[:200])
+    return {"ok": True}
+
+# ------------------------------------------------------------------ execution, evidence, deviations, review
+def parse_steps(text):
+    out = []
+    for line in (text or "").splitlines():
+        if "|" not in line: continue
+        a, e = [x.strip() for x in line.split("|", 1)]; ev = a.startswith("[E]")
+        if ev: a = a[3:].strip()
+        if a and e: out.append((a, e, 1 if ev else 0))
+    return out
+RUNQ = "SELECT runs.*,records.code tc,json_extract(records.data,'$.title') tc_title FROM runs JOIN records ON records.id=runs.tc_id"
+def save_ev(sid, name, raw):
+    ext = os.path.splitext(str(name).lower())[1]
+    if ext not in (".png", ".jpg", ".jpeg", ".pdf", ".txt", ".log", ".csv"): raise HTTPException(422, "File type not allowed")
+    if len(raw) > 5000000: raise HTTPException(422, "File larger than 5 MB")
+    h = hashlib.sha256(raw).hexdigest(); fn = "%s_%s%s" % (sid, h[:12], ext)
+    with open(os.path.join(EVD, fn), "wb") as f: f.write(raw)
+    return fn, h
+def record_step(c, user, s, result, actual, comment, name="", raw=None):
+    fn = h = ""
+    if raw: fn, h = save_ev(s["id"], name, raw)
+    c.execute("UPDATE steps SET result=?,actual=?,comment=?,ev_file=?,ev_name=?,ev_hash=?,done_by=?,ts=? WHERE id=?", (result, actual, comment, fn, name, h, user, now(), s["id"]))
+    run = c.execute("SELECT * FROM runs WHERE id=?", (s["run_id"],)).fetchone()
+    log(c, user, "STEP " + result.upper(), "run", run["id"], "step %s" % s["n"])
+    if result == "Fail":
+        n = c.execute("SELECT COUNT(*) n FROM deviations").fetchone()["n"] + 1
+        c.execute("INSERT INTO deviations(code,title,description,severity,project_id,run_id,step_id,status,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", ("DEV-%04d" % n, ("Step %s: %s" % (s["n"], s["instruction"]))[:120], "Expected: %s\nActual: %s" % (s["expected"], actual), "Major", run["project_id"], run["id"], s["id"], "Open", user, now(), now()))
+        log(c, user, "DEVIATION CREATED", "deviation", n, "DEV-%04d" % n)
+def finish(c, user, rid):
+    res = [x["result"] for x in c.execute("SELECT result FROM steps WHERE run_id=?", (rid,))]
+    st = "Passed" if all(x in ("Pass", "Not Applicable") for x in res) else "Failed"
+    c.execute("UPDATE runs SET status=?,review='Pending Review',completed=? WHERE id=?", (st, now(), rid)); log(c, user, "RUN " + st.upper(), "run", rid); return st
+def run_automation(c, rid, cfg, tc_data, steps_rows):
+    body = json.dumps({"test_case": tc_data.get("title"), "target_url": cfg.get("target_url"), "steps": [{"n": s["n"], "instruction": s["instruction"], "expected": s["expected"]} for s in steps_rows]}).encode()
+    req = urllib.request.Request(cfg["runner_url"], data=body, headers={"Content-Type": "application/json", "Authorization": "Bearer " + cfg.get("_runner_token", "")})
+    try:
+        with urllib.request.urlopen(req, timeout=int(cfg.get("timeout") or 60)) as r: resp = json.loads(r.read())
+        by = {int(x["n"]): x for x in resp.get("results", [])}
+        for s in steps_rows:
+            x = by.get(s["n"])
+            if not x or x.get("result") not in ("Pass", "Fail", "Blocked", "Not Applicable"): raise ValueError("Runner returned no valid result for step %s" % s["n"])
+            ev = (resp.get("evidence") or {}).get(str(s["n"])); raw = base64.b64decode(ev["b64"]) if ev else None
+            res, cm = x["result"], str(x.get("log", ""))[:500]
+            if s["ev_req"] and res in ("Pass", "Fail") and not raw: res, cm = "Blocked", "Mandatory evidence was not provided by the runner"
+            record_step(c, "automation:" + cfg["name"], s, res, str(x.get("actual", ""))[:500], cm, (ev or {}).get("name", ""), raw)
+        return finish(c, "automation:" + cfg["name"], rid), ""
+    except Exception as e:
+        c.execute("UPDATE runs SET status='Runner Error',message=? WHERE id=?", (str(e)[:300], rid)); return "Runner Error", str(e)[:300]
+@app.post("/api/x/runs")
+def start_run(b: Body_ = Body(...), authorization: str = Header(None)):
+    c = db(); u = me(c, authorization); need(u, "execute"); tc = get(c, "test-cases", int(b.get("tc_id") or 0))
+    if tc["status"] != "Approved": raise HTTPException(409, "The test case must be Approved before execution")
+    td = json.loads(tc["data"]); st = parse_steps(td.get("steps"))
+    if not st: raise HTTPException(422, "Test case has no valid steps (Instruction | Expected result)")
+    mode = b.get("mode", "Manual"); cfg = None
+    if mode == "Automated":
+        cr = get(c, "automation-config", int(b.get("config_id") or 0)); cfg = json.loads(cr["data"])
+        if cr["status"] != "Active" or cfg.get("enabled") != "Yes": raise HTTPException(409, "This automation configuration is disabled")
+        if not str(cfg.get("runner_url", "")).startswith(("http://", "https://")): raise HTTPException(422, "Runner URL must start with http:// or https://")
+    ro = b.get("retest_of")
+    if ro and not c.execute("SELECT 1 FROM runs WHERE id=? AND tc_id=?", (ro, tc["id"])).fetchone(): raise HTTPException(422, "Invalid original run")
+    pid = b.get("project_id")
+    if pid and not ref_ok(c, "projects", pid): raise HTTPException(422, "Invalid project")
+    n = c.execute("SELECT COUNT(*) n FROM runs").fetchone()["n"] + 1
+    cur = c.execute("INSERT INTO runs(code,tc_id,project_id,mode,config_id,executor,status,started,retest_of) VALUES(?,?,?,?,?,?,?,?,?)", ("RUN-%04d" % n, tc["id"], pid, mode, b.get("config_id"), u["username"], "In Progress", now(), ro))
+    rid = cur.lastrowid
+    for i, (a, e, v) in enumerate(st, 1): c.execute("INSERT INTO steps(run_id,n,instruction,expected,ev_req) VALUES(?,?,?,?,?)", (rid, i, a, e, v))
+    log(c, u["username"], "RUN START", "run", rid, tc["code"]); msg = ""
+    if mode == "Automated":
+        rows = c.execute("SELECT * FROM steps WHERE run_id=? ORDER BY n", (rid,)).fetchall(); cfg["name"] = cfg.get("name", "runner")
+        _, msg = run_automation(c, rid, cfg, td, rows)
+    c.commit(); return {"id": rid, "message": msg}
+@app.get("/api/x/runs")
+def runs(authorization: str = Header(None)):
+    c = db(); me(c, authorization); return [dict(r) for r in c.execute(RUNQ + " ORDER BY runs.id DESC")]
+@app.get("/api/x/runs/{rid}")
+def run_detail(rid: int, authorization: str = Header(None)):
+    c = db(); me(c, authorization); r = c.execute(RUNQ + " WHERE runs.id=?", (rid,)).fetchone()
+    if not r: raise HTTPException(404, "Run not found")
+    rt = [{"run": dict(x), "steps": {s["n"]: s["result"] for s in c.execute("SELECT n,result FROM steps WHERE run_id=?", (x["id"],))}} for x in c.execute("SELECT * FROM runs WHERE retest_of=? ORDER BY id", (rid,))]
+    return {"run": dict(r), "steps": [dict(s) for s in c.execute("SELECT * FROM steps WHERE run_id=? ORDER BY n", (rid,))], "deviations": [dict(d) for d in c.execute("SELECT * FROM deviations WHERE run_id=?", (rid,))], "retests": rt}
+@app.post("/api/x/steps/{sid}/result")
+def step_result(sid: int, b: Body_ = Body(...), authorization: str = Header(None)):
+    c = db(); u = me(c, authorization); need(u, "execute"); s = c.execute("SELECT * FROM steps WHERE id=?", (sid,)).fetchone()
+    if not s: raise HTTPException(404, "Step not found")
+    run = c.execute("SELECT * FROM runs WHERE id=?", (s["run_id"],)).fetchone()
+    if run["status"] != "In Progress": raise HTTPException(409, "The run is not in progress")
+    if run["executor"] != u["username"]: raise HTTPException(403, "Only the assigned executor can record results")
+    if s["result"]: raise HTTPException(409, "Result already recorded and cannot be overwritten. Use Re-Execution to correct it")
+    res, act, cm = b.get("result"), str(b.get("actual") or "").strip(), str(b.get("comment") or "").strip()
+    if res not in ("Pass", "Fail", "Blocked", "Not Applicable"): raise HTTPException(422, "Invalid result")
+    if res in ("Pass", "Fail") and not act: raise HTTPException(422, "Actual result is required")
+    if res in ("Blocked", "Not Applicable") and not cm: raise HTTPException(422, "A justification is required")
+    raw = None
+    if b.get("file_b64"):
+        try: raw = base64.b64decode(b["file_b64"])
+        except Exception: raise HTTPException(422, "Invalid file")
+    if s["ev_req"] and res in ("Pass", "Fail") and not raw: raise HTTPException(422, "Evidence is mandatory for this step")
+    record_step(c, u["username"], s, res, act, cm, str(b.get("file_name") or ""), raw); c.commit(); return {"ok": True}
+@app.get("/api/x/evidence/{sid}")
+def evidence(sid: int, authorization: str = Header(None)):
+    c = db(); me(c, authorization); s = c.execute("SELECT ev_file,ev_name FROM steps WHERE id=?", (sid,)).fetchone()
+    if not s or not s["ev_file"]: raise HTTPException(404, "No evidence")
+    return FileResponse(os.path.join(EVD, s["ev_file"]), filename=s["ev_name"])
+@app.post("/api/x/runs/{rid}/complete")
+def complete(rid: int, authorization: str = Header(None)):
+    c = db(); u = me(c, authorization); r = c.execute("SELECT * FROM runs WHERE id=?", (rid,)).fetchone()
+    if not r: raise HTTPException(404, "Run not found")
+    if r["status"] != "In Progress" or r["executor"] != u["username"]: raise HTTPException(409, "Only the executor can complete a run that is in progress")
+    miss = c.execute("SELECT COUNT(*) n FROM steps WHERE run_id=? AND result IS NULL", (rid,)).fetchone()["n"]
+    if miss: raise HTTPException(422, "%d step(s) still have no result" % miss)
+    st = finish(c, u["username"], rid); c.commit(); return {"status": st}
+@app.post("/api/x/runs/{rid}/review")
+def review_run(rid: int, b: Body_ = Body(...), authorization: str = Header(None)):
+    c = db(); u = me(c, authorization); r = c.execute("SELECT * FROM runs WHERE id=?", (rid,)).fetchone()
+    if not r or r["review"] != "Pending Review": raise HTTPException(409, "This run is not awaiting review")
+    to, cm = b.get("to"), str(b.get("comment") or "").strip()
+    if to not in ("Approved", "Returned"): raise HTTPException(422, "Invalid decision")
+    need(u, "approve" if to == "Approved" else "review")
+    if r["executor"] == u["username"]: raise HTTPException(403, "The executor cannot review their own run")
+    if to == "Returned" and not cm: raise HTTPException(422, "A reason is required to return a run")
+    if to == "Approved":
+        ec = cfgfor(c, "esign-config", "Approved"); sign(c, u, "run", rid, r, (ec or {}).get("meaning") or "Approved", str(b.get("password") or ""))
+    c.execute("UPDATE runs SET review=?,review_by=?,review_note=? WHERE id=?", (to, u["username"], cm, rid)); log(c, u["username"], "RUN REVIEW " + to.upper(), "run", rid, cm); c.commit(); return {"ok": True}
+@app.get("/api/x/queue")
+def queue(authorization: str = Header(None)):
+    c = db(); me(c, authorization); recs = []
+    for r in c.execute("SELECT * FROM records WHERE status='In Review' OR (status='Draft' AND note LIKE 'Returned:%') ORDER BY updated_at DESC"):
+        if r["res"] in WF: recs.append({"key": r["res"], "label": R[r["res"]]["label"], "id": r["id"], "code": r["code"], "title": json.loads(r["data"]).get(R[r["res"]]["title"], ""), "status": r["status"], "note": r["note"], "by": r["created_by"], "at": r["updated_at"]})
+    return {"records": recs, "runs": [dict(x) for x in c.execute(RUNQ + " WHERE runs.review='Pending Review' ORDER BY runs.id DESC")]}
+DFLOW = {"Open": ["Under Assessment"], "Under Assessment": ["Corrected"], "Corrected": ["Closed", "Under Assessment"]}
+DP = {"Under Assessment": ["review", "approve"], "Corrected": ["execute", "create"], "Closed": ["approve"]}
+@app.get("/api/x/deviations")
+def devs(authorization: str = Header(None)):
+    c = db(); me(c, authorization); return [dict(d, run_code=(c.execute("SELECT code FROM runs WHERE id=?", (d["run_id"],)).fetchone() or {"code": ""})["code"], project=lab(c, d["project_id"]) if d["project_id"] else "", assignee=lab(c, d["assigned_to"]) if d["assigned_to"] else "") for d in c.execute("SELECT * FROM deviations ORDER BY id DESC")]
+@app.post("/api/x/deviations")
+def new_dev(b: Body_ = Body(...), authorization: str = Header(None)):
+    c = db(); u = me(c, authorization); need(u, "create", "execute"); t = str(b.get("title") or "").strip()
+    if not t or not str(b.get("description") or "").strip(): raise HTTPException(422, "Title and description are required")
+    if b.get("severity") not in ("Critical", "Major", "Minor"): raise HTTPException(422, "Choose a severity")
+    pid, ass = b.get("project_id"), b.get("assigned_to")
+    if (pid and not ref_ok(c, "projects", pid)) or (ass and not ref_ok(c, "user", ass)): raise HTTPException(422, "Invalid project or assignee")
+    n = c.execute("SELECT COUNT(*) n FROM deviations").fetchone()["n"] + 1
+    cur = c.execute("INSERT INTO deviations(code,title,description,severity,project_id,status,assigned_to,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)", ("DEV-%04d" % n, t, b["description"], b["severity"], pid, "Open", ass, u["username"], now(), now()))
+    log(c, u["username"], "DEVIATION CREATED", "deviation", cur.lastrowid, ""); c.commit(); return {"id": cur.lastrowid}
+@app.post("/api/x/deviations/{did}/status")
+def dev_status(did: int, b: Body_ = Body(...), authorization: str = Header(None)):
+    c = db(); u = me(c, authorization); d = c.execute("SELECT * FROM deviations WHERE id=?", (did,)).fetchone(); to, cm = b.get("to"), str(b.get("comment") or "").strip()
+    if not d: raise HTTPException(404, "Deviation not found")
+    if to not in DFLOW.get(d["status"], []): raise HTTPException(409, "Cannot move from %s to %s" % (d["status"], to))
+    need(u, *DP[to])
+    if not cm: raise HTTPException(422, "A comment is required")
+    if to == "Closed" and d["step_id"]:
+        n = c.execute("SELECT n FROM steps WHERE id=?", (d["step_id"],)).fetchone()["n"]
+        if not c.execute("SELECT 1 FROM runs r JOIN steps s ON s.run_id=r.id WHERE r.retest_of=? AND s.n=? AND s.result='Pass'", (d["run_id"], n)).fetchone(): raise HTTPException(409, "Closure needs a re-execution where this step passes")
+    c.execute("UPDATE deviations SET status=?,note=?,updated_at=? WHERE id=?", (to, cm, now(), did)); log(c, u["username"], "DEVIATION %s -> %s" % (d["status"], to), "deviation", did, cm); c.commit(); return {"status": to}
+@app.get("/api/x/report/{rid}")
+def run_report(rid: int, authorization: str = Header(None)):
+    c = db(); me(c, authorization); r = c.execute(RUNQ + " WHERE runs.id=?", (rid,)).fetchone()
+    if not r: raise HTTPException(404, "Run not found")
+    import html as hh; e = lambda x: hh.escape(str(x if x is not None else ""))
+    rows = "".join("<tr><td>%s<td>%s%s<td>%s<td>%s<td><b>%s</b><td>%s<td>%s<br><small>%s</small><td>%s<br><small>%s</small></tr>" % (s["n"], e(s["instruction"]), " [E]" if s["ev_req"] else "", e(s["expected"]), e(s["actual"]), e(s["result"] or "Not executed"), e(s["comment"]), e(s["ev_name"]), e((s["ev_hash"] or "")[:16]), e(s["done_by"]), e(s["ts"])) for s in c.execute("SELECT * FROM steps WHERE run_id=? ORDER BY n", (rid,)))
+    dv = "".join("<tr><td>%s<td>%s<td>%s<td>%s</tr>" % (e(d["code"]), e(d["title"]), e(d["status"]), e(d["note"])) for d in c.execute("SELECT * FROM deviations WHERE run_id=?", (rid,)))
+    rt = "".join("<tr><td>%s<td>%s<td>%s</tr>" % (e(x["code"]), e(x["status"]), e(x["executor"])) for x in c.execute("SELECT * FROM runs WHERE retest_of=?", (rid,)))
+    sg = "".join("<tr><td>%s<td>%s<td>%s</tr>" % (e(x["user"]), e(x["meaning"]), e(x["ts"])) for x in c.execute("SELECT * FROM esign WHERE (res='run' AND rec_id=?) OR (res='test-cases' AND rec_id=?)", (rid, r["tc_id"])))
+    css = "<style>body{font-family:Arial;font-size:12px}table{border-collapse:collapse;width:100%;margin-bottom:12px}td,th{border:1px solid #999;padding:5px;text-align:left;vertical-align:top}th{background:#405945;color:#fff}</style>"
+    return {"html": css + "<h2>Execution Report %s</h2><p>Test case: %s – %s<br>Mode: %s | Executor: %s<br>Outcome: <b>%s</b> | Review: %s %s<br>Started: %s | Completed: %s | Retest of run: %s<br>Generated: %s</p><h3>Steps</h3><table><tr><th>#<th>Instruction<th>Expected<th>Actual<th>Result<th>Comment<th>Evidence<th>By</tr>%s</table><h3>Deviations</h3><table><tr><th>ID<th>Title<th>Status<th>Note</tr>%s</table><h3>Re-executions</h3><table><tr><th>Run<th>Outcome<th>Executor</tr>%s</table><h3>Signatures</h3><table><tr><th>Signer<th>Meaning<th>Time</tr>%s</table>" % (e(r["code"]), e(r["tc"]), e(r["tc_title"]), r["mode"], e(r["executor"]), e(r["status"]), e(r["review"]), e(r["review_by"]), e(r["started"]), e(r["completed"]), e(r["retest_of"] or "n/a"), now(), rows, dv, rt, sg)}
+
+# ------------------------------------------------------------------ reports
+@app.get("/api/rep/{name}")
+def report(name: str, authorization: str = Header(None)):
+    c = db(); u = me(c, authorization); note = ""
+    if name in ("sessions", "user-usertype", "usertype-perms", "full-access", "audit"): need(u, "admin")
+    users = [(r["id"], json.loads(r["data"]), r["status"], r["code"]) for r in c.execute("SELECT * FROM records WHERE res='user' ORDER BY id")]
+    uts = {r["id"]: json.loads(r["data"]) for r in c.execute("SELECT * FROM records WHERE res='usertypes'")}
+    if name == "sessions": cols = ["Time", "User", "Event", "Detail"]; rows = [[r["ts"], r["user"], r["event"], r["detail"]] for r in c.execute("SELECT * FROM sessions ORDER BY id DESC LIMIT 500")]
+    elif name == "user-usertype": cols = ["User ID", "Username", "Name", "Usertype", "Status"]; rows = [[code, d["username"], d["name"], uts.get(d.get("usertype"), {}).get("name", ""), st] for _, d, st, code in users]
+    elif name == "usertype-perms": cols = ["Usertype", "Permissions"]; rows = [[d["name"], ", ".join(d.get("permissions", []))] for d in uts.values()]
+    elif name == "full-access": cols = ["Username", "Usertype", "Permission"]; rows = [[d["username"], uts.get(d.get("usertype"), {}).get("name", ""), p] for _, d, _s, _c in users for p in uts.get(d.get("usertype"), {}).get("permissions", [])]
+    elif name == "audit":
+        cols = ["Time", "User", "Action", "Record type", "Record", "Detail"]; rows = []; prev = "0" * 64; ok = True
+        for a in c.execute("SELECT * FROM audit ORDER BY id"):
+            if a["prev"] != prev or a["hash"] != H(prev + a["ts"] + a["user"] + a["action"] + a["res"] + str(a["rec_id"]) + a["detail"]): ok = False
+            prev = a["hash"]; rows.append([a["ts"], a["user"], a["action"], a["res"], a["rec_id"], a["detail"]])
+        rows.reverse(); note = "Hash chain: " + ("VERIFIED" if ok else "BROKEN")
+    elif name == "documents": cols = ["Code", "Title", "Type", "Template", "Project", "Version", "Status", "Created by", "Updated"]; rows = [[r["code"], d.get("title"), lab(c, d.get("doc_type")), lab(c, d.get("template")), lab(c, d["project"]) if d.get("project") else "", r["version"], r["status"], r["created_by"], r["updated_at"]] for r in c.execute("SELECT * FROM records WHERE res='document-creation' ORDER BY id DESC") for d in [json.loads(r["data"])]]
+    elif name == "executions": cols = ["Run", "Test case", "Mode", "Executor", "Status", "Review", "Started", "Completed", "Retest of", "Pass", "Fail"]; rows = [[r["code"], r["tc"] + " " + str(r["tc_title"]), r["mode"], r["executor"], r["status"], r["review"] or "", r["started"], r["completed"] or "", r["retest_of"] or "", c.execute("SELECT COUNT(*) n FROM steps WHERE run_id=? AND result='Pass'", (r["id"],)).fetchone()["n"], c.execute("SELECT COUNT(*) n FROM steps WHERE run_id=? AND result='Fail'", (r["id"],)).fetchone()["n"]] for r in c.execute(RUNQ + " ORDER BY runs.id DESC")]
+    elif name == "approvals": cols = ["Record type", "Record", "Signer", "Meaning", "Time"]; rows = [[s["res"], (c.execute("SELECT code FROM records WHERE id=?", (s["rec_id"],)).fetchone() or {"code": s["rec_id"]})["code"] if s["res"] != "run" else (c.execute("SELECT code FROM runs WHERE id=?", (s["rec_id"],)).fetchone() or {"code": ""})["code"], s["user"], s["meaning"], s["ts"]] for s in c.execute("SELECT * FROM esign ORDER BY id DESC")]
+    else: raise HTTPException(404, "Unknown report")
+    return {"cols": cols, "rows": rows, "note": note}
